@@ -67,14 +67,14 @@ def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def filter_by_invoice_date(df: pd.DataFrame, start_dt: date, end_dt: date) -> pd.DataFrame:
+def filter_by_due_date(df: pd.DataFrame, start_dt: date, end_dt: date) -> pd.DataFrame:
     """
-    Inclusive date-range filter on 'Invoice date' using pandas Series comparisons.
+    Inclusive date-range filter on 'Due date' using pandas Series comparisons.
     """
     start_ts = pd.to_datetime(start_dt)  # midnight
     end_ts = pd.to_datetime(end_dt) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)  # end-of-day inclusive
 
-    ser = df['Invoice date']  # keep as Series (no .values)
+    ser = df['Due date']  # keep as Series (no .values)
     mask = ser.notna() & (ser >= start_ts) & (ser <= end_ts)
     return df.loc[mask].copy()
 
@@ -121,7 +121,7 @@ def to_excel_bytes(df_out: pd.DataFrame) -> bytes:
 
 
 # ----------------- UI: Data source -----------------
-st.title("💳 Payments Totals – Bank Breakdown (Minimal)")
+st.title("💳 Payments Totals – Bank Breakdown (Minimal, Due date)")
 
 with st.expander("📁 Data source"):
     col1, col2 = st.columns([2, 1])
@@ -171,23 +171,23 @@ with st.expander("🔎 Diagnostics (optional)", expanded=False):
     st.dataframe(df.head(20), use_container_width=True)
 
 # ----------------- Filters -----------------
-st.subheader("Filter by Invoice Date")
+st.subheader("Filter by Due Date")
 
-invoice_dates = df['Invoice date'].dropna()
-min_inv = invoice_dates.min().date() if not invoice_dates.empty else date.today()
-max_inv = invoice_dates.max().date() if not invoice_dates.empty else date.today()
+due_dates = df['Due date'].dropna()
+min_due = due_dates.min().date() if not due_dates.empty else date.today()
+max_due = due_dates.max().date() if not due_dates.empty else date.today()
 
 c1, c2 = st.columns(2)
 with c1:
-    start_date = st.date_input("Start date", value=min_inv, min_value=min_inv, max_value=max_inv)
+    start_date = st.date_input("Start date", value=min_due, min_value=min_due, max_value=max_due)
 with c2:
-    end_date = st.date_input("End date", value=max_inv, min_value=min_inv, max_value=max_inv)
+    end_date = st.date_input("End date", value=max_due, min_value=min_due, max_value=max_due)
 
 if start_date > end_date:
     st.error("Start date cannot be after End date.")
     st.stop()
 
-filtered = filter_by_invoice_date(df, start_date, end_date)
+filtered = filter_by_due_date(df, start_date, end_date)
 
 # ----------------- Choice: which outstanding to show -----------------
 choice = st.radio(
@@ -206,7 +206,7 @@ amount_to_show = (
     else totals["amount_to_be_paid_unpaid_only"]
 )
 
-st.subheader("Summary (Selected Date Range)")
+st.subheader("Summary (Selected Due Date Range)")
 m1, m2, m3, m4, m5 = st.columns(5)
 with m1:
     st.metric("Rows", totals["rows"])
@@ -275,6 +275,7 @@ st.markdown(r"""
 **Notes**
 - Place `Book10.xlsx` next to `app.py` or upload it via the top uploader.
 - Select the correct **date format** (Auto/MM/DD/YYYY/DD/MM/YYYY) to ensure identical parsing between VS Code and Streamlit.
+- Filtering and summaries are based on **Due date** (inclusive end-of-day).
 - *Amount to be Paid (Outstanding)* can be shown for **all filtered rows** or **only rows marked 'Un paid'** — use the radio choice above.
 - Comparisons use pandas **Series vs Timestamp** (no NumPy arrays), avoiding the original `TypeError`.
 """)
