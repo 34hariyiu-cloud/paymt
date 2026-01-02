@@ -1,349 +1,269 @@
 
-# -*- coding: utf-8 -*-
 # app.py
-# Streamlit Payments Dashboard with Data Cleaning
-# Author: Sivaprakash (with Copilot assistance)
-
-import io
-import math
-from typing import Optional, Tuple
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from datetime import date
+from pathlib import Path
 
-# -----------------------------
-# Page Setup
-# -----------------------------
-st.set_page_config(page_title="Payments Dashboard", page_icon="💵", layout="wide")
+st.set_page_config(page_title="Payments Totals - Bank Breakdown", layout="wide")
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# --------------- Constants ---------------
+EXPECTED_COLS = [
+    'Bank Name', 'Payment mode', 'Due date', 'Payment Date', 'Vendor Name',
+    'Invoice number', 'Invoice date', 'Invoice value', 'TDS',
+    'Amount Paid', 'UTR no.', 'Payment status'
+]
 
-def inr(value) -> str:
+# Default local path: a file named Book10.xlsx next to app.py
+DEFAULT_LOCAL_PATH = Path(__file__).with_name("Book10.xlsx")
+
+# --------------- Helper functions ---------------
+
+def fix_headers(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Format a numeric value as Indian Rupees with Indian-digit grouping.
-    Example: 1234567.8 -> ₹12,34,567.80
-    Handles None/NaN gracefully by returning "₹0.00".
+    Normalize headers to EXPECTED_COLS.
+    Your Excel has the header row embedded as the first data row. We drop it and set EXPECTED_COLS.
     """
-    try:
-        if value is None:
-            return "₹0.00"
-        if isinstance(value, float) and math.isnan(value):
-            return "₹0.00"
-        val = float(value)
-    except Exception:
-        return "₹0.00"
-
-    s = f"{abs(val):.2f}"
-    whole, frac = s.split(".")
-    # Indian-style digit grouping (last 3 digits, then groups of 2)
-    if len(whole) > 3:
-        prefix = whole[:-3]
-        last3 = whole[-3:]
-        grouped = ""
-        while len(prefix) > 2:
-            grouped = "," + prefix[-2:] + grouped
-            prefix = prefix[:-2]
-        if prefix:
-            grouped = prefix + grouped
-        whole = grouped + "," + last3
-    sign = "-" if val < 0 else ""
-    return f"{sign}₹{whole}.{frac}"
-
-def parse_date_series(s: pd.Series, dayfirst: bool = False) -> pd.Series:
-    """
-    Safe date parsing that avoids deprecated 'infer_datetime_format'.
-    Tries general parsing; if still NaT-heavy, attempts common explicit formats.
-    """
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=dayfirst)
-
-    # If too many NaT, try known patterns without raising exceptions.
-    nat_ratio = dt.isna().mean()
-    if nat_ratio > 0.5:
-        iso_try = pd.to_datetime(s, errors="coerce", format="%Y-%m-%d")
-        dt = dt.fillna(iso_try)
-        if dt.isna().any():
-            df_try = pd.to_datetime(s, errors="coerce", format="%d-%m-%Y")
-            dt = dt.fillna(df_try)
-        if dt.isna().any():
-            df_try2 = pd.to_datetime(s, errors="coerce", format="%d/%m/%Y")
-            dt = dt.fillna(df_try2)
-
-    return dt
-
-def clean_amount_series(s: pd.Series) -> pd.Series:
-    """
-    Convert currency-like strings to numeric:
-    - Removes non-numeric chars (₹, spaces, commas)
-    - Keeps minus and decimal
-    - Returns float with NaN for invalid
-    """
-    if s.dtype.kind in "fi":
-        return s.astype(float)
-
-    cleaned = (
-        s.astype(str)
-         .str.replace(r"[₹, ]", "", regex=True)
-         .str.replace(r"[^\d\.\-]", "", regex=True)
-    )
-    return pd.to_numeric(cleaned, errors="coerce")
-
-def to_numeric_series(s: pd.Series) -> pd.Series:
-    """Coerce to numeric with NaN for invalid entries."""
-    return pd.to_numeric(s, errors="coerce")
-
-def normalize_status_series(s: pd.Series) -> pd.Series:
-    """
-    Normalize status values into: paid / pending / cancelled / other.
-    """
-    s2 = s.astype(str).str.strip().str.lower()
-    def normalize(x: str) -> str:
-        if any(k in x for k in ["paid", "settled", "complete", "completed", "closed", "success"]):
-            return "paid"
-        if any(k in x for k in ["unpaid", "due", "pending", "await", "open", "outstanding"]):
-            return "pending"
-        if any(k in x for k in ["cancel", "void", "reversed", "failed"]):
-            return "cancelled"
-        return x
-    return s2.apply(normalize)
-
-def compute_amounts(
-    df: pd.DataFrame,
-    amount_col: str,
-    amount_paid_col: Optional[str] = None,
-    outstanding_col: Optional[str] = None,
-    status_col: Optional[str] = None
-) -> Tuple[float, float, float]:
-    """
-    Compute total amount, amount paid, and outstanding based on available columns.
-    """
-    total_amount = to_numeric_series(df[amount_col]).sum()
-
-    amount_paid = 0.0
-    outstanding = None
-
-    if amount_paid_col and amount_paid_col in df.columns:
-        amount_paid = to_numeric_series(df[amount_paid_col]).sum()
-        outstanding = total_amount - amount_paid
-    elif outstanding_col and outstanding_col in df.columns:
-        outstanding = to_numeric_series(df[outstanding_col]).sum()
-        amount_paid = total_amount - outstanding
-    elif status_col and status_col in df.columns:
-        status_norm = normalize_status_series(df[status_col])
-        paid_mask = status_norm.eq("paid")
-        amount_paid = to_numeric_series(df.loc[paid_mask, amount_col]).sum()
-        outstanding = total_amount - amount_paid
+    first_row = df_raw.iloc[0].astype(str).tolist()
+    if 'Bank Name' in first_row:
+        df = df_raw.iloc[1:].reset_index(drop=True)
+        df.columns = EXPECTED_COLS
     else:
-        outstanding = total_amount
-
-    return float(total_amount), float(amount_paid), float(outstanding)
-
-def read_uploaded_file(uploaded_file) -> pd.DataFrame:
-    """
-    Robust reader: CSV / XLSX / XLS.
-    Detect CSV delimiter when file loads as single column.
-    """
-    data_bytes = uploaded_file.getvalue()
-    bio = io.BytesIO(data_bytes)
-    fname = uploaded_file.name.lower()
-
-    if fname.endswith(".csv"):
-        df = pd.read_csv(bio)
-        if df.shape[1] == 1:
-            bio.seek(0)
-            df_alt = pd.read_csv(bio, sep=";")
-            if df_alt.shape[1] > 1:
-                df = df_alt
-    elif fname.endswith(".xlsx"):
-        df = pd.read_excel(bio, engine="openpyxl")
-    elif fname.endswith(".xls"):
-        # xlrd may not be installed; show a friendly error if read fails
-        try:
-            df = pd.read_excel(bio, engine="xlrd")
-        except Exception as e:
-            raise RuntimeError("Unable to read .xls (old Excel). Please convert to .xlsx and re-upload. "
-                               f"Original error: {e}")
-    else:
-        raise RuntimeError("Unsupported file type. Please upload a .csv, .xlsx, or .xls file.")
+        df = df_raw.copy()
+        df.columns = EXPECTED_COLS
     return df
 
-# -----------------------------
-# Sidebar: Data Input & Mapping
-# -----------------------------
-st.sidebar.header("📄 Data source")
-uploaded_file = st.sidebar.file_uploader(
-    "Upload a CSV or Excel invoice file",
-    type=["csv", "xlsx", "xls"],
-    help="Include columns for amount, status/paid/outstanding, and optionally date/invoice id."
-)
 
-st.sidebar.header("🧼 Data cleaning options")
-dayfirst = st.sidebar.checkbox("Parse dates as day-first (DD-MM-YYYY)", value=False)
-apply_trim = st.sidebar.checkbox("Trim whitespace in text columns", value=True)
-normalize_status_opt = st.sidebar.checkbox("Normalize status values (paid/pending/cancelled)", value=True)
-dedup_opt = st.sidebar.checkbox("Remove duplicate rows", value=True)
-drop_invalid_amount_opt = st.sidebar.checkbox("Drop rows with invalid/non-positive amount", value=True)
-clean_currency_opt = st.sidebar.checkbox("Convert currency-like amounts to numeric", value=True)
+def read_excel_any(source) -> pd.DataFrame:
+    """
+    Read Excel from a file path (str/Path) or a file-like object (Streamlit uploader).
+    Always read with header=None, then fix headers with fix_headers().
+    """
+    df_raw = pd.read_excel(source, engine="openpyxl", header=None)
+    df = fix_headers(df_raw)
+    return df
 
-st.sidebar.header("🔠 Column mapping")
-st.sidebar.caption("Map your file's columns to the expected fields (case-sensitive).")
 
-amount_col = st.sidebar.text_input("Amount column name", value="amount")
-amount_paid_col = st.sidebar.text_input("Amount paid column name (optional)", value="amount_paid")
-outstanding_col = st.sidebar.text_input("Outstanding column name (optional)", value="outstanding")
-date_col = st.sidebar.text_input("Date column name (optional)", value="date")
-invoice_id_col = st.sidebar.text_input("Invoice ID column name (optional)", value="invoice_id")
-status_col = st.sidebar.text_input("Status column name (optional)", value="status")
+def coerce_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert date-like columns to datetime64[ns] with safe coercion.
+    Any invalid/missing dates become NaT.
+    """
+    for c in ['Due date', 'Payment Date', 'Invoice date']:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors='coerce')  # dayfirst=False by default
+            if pd.api.types.is_datetime64tz_dtype(df[c]):
+                df[c] = df[c].dt.tz_localize(None)
+    return df
 
-# -----------------------------
-# Main App
-# -----------------------------
-st.title("💵 Payments Dashboard")
 
-if not uploaded_file:
-    st.info("Upload a CSV/Excel file to continue.")
-    st.stop()
+def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure numeric columns are numeric (float). Invalid entries become NaN."""
+    for c in ['Invoice value', 'TDS', 'Amount Paid']:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df
 
-# Load data
-try:
-    df_raw = read_uploaded_file(uploaded_file)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
 
-# Validate required amount column
-if amount_col not in df_raw.columns:
-    st.error(f"Amount column '{amount_col}' not found in uploaded file. Please correct the mapping in the sidebar.")
-    st.stop()
+def filter_by_date_range(df: pd.DataFrame, start_dt: date, end_dt: date, date_col: str) -> pd.DataFrame:
+    """
+    Inclusive date-range filter on the chosen date column.
+    Keeps comparisons in pandas Series to avoid ndarray-vs-Timestamp TypeError.
+    """
+    if date_col not in df.columns:
+        st.warning(f"Column '{date_col}' not found. Available: {list(df.columns)}")
+        return df.copy()
 
-# Cleaning Pipeline
-df = df_raw.copy()
-rows_before = len(df)
+    ser = df[date_col]
+    start_ts = pd.to_datetime(start_dt)  # midnight
+    end_ts   = pd.to_datetime(end_dt)
+    end_ts = end_ts + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)  # inclusive end-of-day
+    mask = ser.notna() & (ser >= start_ts) & (ser <= end_ts)
+    return df.loc[mask].copy()
 
-# 1) Trim strings
-if apply_trim:
-    str_cols = df.select_dtypes(include=["object", "string"]).columns
-    for c in str_cols:
-        df[c] = df[c].astype(str).str.strip()
 
-# 2) Clean numeric-like amounts
-if clean_currency_opt:
-    df[amount_col] = clean_amount_series(df[amount_col])
-    if amount_paid_col and amount_paid_col in df.columns:
-        df[amount_paid_col] = clean_amount_series(df[amount_paid_col])
-    if outstanding_col and outstanding_col in df.columns:
-        df[outstanding_col] = clean_amount_series(df[outstanding_col])
-else:
-    df[amount_col] = to_numeric_series(df[amount_col])
-    if amount_paid_col and amount_paid_col in df.columns:
-        df[amount_paid_col] = to_numeric_series(df[amount_paid_col])
-    if outstanding_col and outstanding_col in df.columns:
-        df[outstanding_col] = to_numeric_series(df[outstanding_col])
+def add_optional_filters(df: pd.DataFrame, bank_sel=None, pmode_sel=None, vendor_sel=None, pstatus_sel=None) -> pd.DataFrame:
+    """Apply optional filters based on multiselect inputs."""
+    out = df.copy()
+    if bank_sel:
+        out = out[out['Bank Name'].isin(bank_sel)]
+    if pmode_sel:
+        out = out[out['Payment mode'].isin(pmode_sel)]
+    if vendor_sel:
+        out = out[out['Vendor Name'].isin(vendor_sel)]
+    if pstatus_sel:
+        out = out[out['Payment status'].isin(pstatus_sel)]
+    return out
 
-# 3) Parse date
-if date_col and date_col in df.columns:
-    df[date_col] = parse_date_series(df[date_col], dayfirst=dayfirst)
 
-# 4) Normalize status
-if normalize_status_opt and status_col and status_col in df.columns:
-    df[status_col] = normalize_status_series(df[status_col])
+def to_excel_bytes(df_out: pd.DataFrame) -> bytes:
+    """Return Excel bytes for download."""
+    with pd.ExcelWriter("filtered_output.xlsx", engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="Filtered")
+    with open("filtered_output.xlsx", "rb") as f:
+        return f.read()
 
-# 5) Drop invalid/non-positive amount rows
-dropped_invalid_amount = 0
-if drop_invalid_amount_opt:
-    invalid_mask = df[amount_col].isna() | (df[amount_col] <= 0)
-    dropped_invalid_amount = int(invalid_mask.sum())
-    df = df.loc[~invalid_mask].copy()
 
-# 6) Deduplicate
-removed_dupes = 0
-if dedup_opt:
-    before = len(df)
-    if invoice_id_col and invoice_id_col in df.columns:
-        df = df.drop_duplicates(subset=[invoice_id_col], keep="first")
-    else:
-        subset = [c for c in [date_col, amount_col, status_col] if c and c in df.columns]
-        df = df.drop_duplicates(subset=subset, keep="first") if subset else df.drop_duplicates(keep="first")
-    removed_dupes = before - len(df)
+# --------------- UI: Data loading ---------------
 
-rows_after = len(df)
+st.title("💳 Payments Totals – Bank Breakdown")
 
-# Summary
-st.subheader("🧼 Cleaning summary")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Rows (before)", rows_before)
-c2.metric("Invalid amount rows dropped", dropped_invalid_amount)
-c3.metric("Duplicates removed", removed_dupes)
-c4.metric("Rows (after)", rows_after)
+st.caption("Load from local file if present, or upload an Excel file with the same columns.")
 
-st.divider()
+df = None
 
-# Filters (Date)
-fdf = df.copy()
-if date_col and date_col in fdf.columns and fdf[date_col].notna().any():
-    st.subheader("🔍 Filters")
-    min_date = pd.to_datetime(fdf[date_col], errors="coerce").min()
-    max_date = pd.to_datetime(fdf[date_col], errors="coerce").max()
-    if pd.notna(min_date) and pd.notna(max_date):
-        start_date, end_date = st.slider(
-            "Date range",
-            min_value=min_date.to_pydatetime(),
-            max_value=max_date.to_pydatetime(),
-            value=(min_date.to_pydatetime(), max_date.to_pydatetime()),
-            format="YYYY-MM-DD",
-            help="Use the slider to filter invoices by date."
+with st.expander("📁 Data source"):
+    col_src1, col_src2 = st.columns([2, 1])
+    with col_src1:
+        # Text input defaults to the Book10.xlsx next to app.py
+        custom_path = st.text_input(
+            "Local Excel file path (optional)",
+            value=str(DEFAULT_LOCAL_PATH),
+            placeholder=r"C:\Users\Sivaprakash\Downloads\payments_totals_streamlit_bank_breakdown\Book10.xlsx"
         )
-        mask = (fdf[date_col] >= pd.to_datetime(start_date)) & (fdf[date_col] <= pd.to_datetime(end_date))
-        fdf = fdf.loc[mask].copy()
+    with col_src2:
+        uploaded_file = st.file_uploader("Or upload Excel (.xlsx)", type=["xlsx"])
 
-# KPI cards
-total_amount, amount_paid, outstanding = compute_amounts(
-    fdf,
-    amount_col=amount_col,
-    amount_paid_col=amount_paid_col if amount_paid_col in fdf.columns else None,
-    outstanding_col=outstanding_col if outstanding_col in fdf.columns else None,
-    status_col=status_col if status_col in fdf.columns else None
+# Priority: uploaded file > custom path
+try:
+    if uploaded_file is not None:
+        df = read_excel_any(uploaded_file)
+        st.success("✅ Uploaded file loaded successfully.")
+    else:
+        p = Path(custom_path)
+        if p.exists():
+            df = read_excel_any(p)
+            st.success(f"✅ Loaded local file: {p}")
+        else:
+            st.error("❌ File not found. Please upload an Excel file or provide a valid local path.")
+            st.stop()
+except Exception as e:
+    st.error(f"Failed to read Excel: {e}")
+    st.stop()
+
+# Coerce dates & numeric columns
+df = coerce_dates(df)
+df = coerce_numeric(df)
+
+# Preview
+with st.expander("🔎 Data preview & info", expanded=False):
+    st.write("**Columns**:", list(df.columns))
+    st.write("**Dtypes**:")
+    st.write(df.dtypes.astype(str))
+    st.write("**Sample rows**:")
+    st.dataframe(df.head(20), use_container_width=True)
+
+# --------------- UI: Filters ---------------
+
+st.subheader("Filter controls")
+
+date_col_choice = st.selectbox(
+    "Filter by date column",
+    options=['Invoice date', 'Payment Date', 'Due date'],
+    index=0
 )
 
-k1, k2, k3 = st.columns(3)
-k1.subheader("Total amount")
-k1.markdown(f"**{inr(total_amount)}**")
-k1.caption(f"(from {len(fdf)} invoices)")
+date_series = df[date_col_choice].dropna()
+if not date_series.empty:
+    min_dt = date_series.min().date()
+    max_dt = date_series.max().date()
+else:
+    min_dt = date.today()
+    max_dt = date.today()
 
-k2.subheader("Amount paid")
-k2.markdown(f"**{inr(amount_paid)}**")
+col_date1, col_date2 = st.columns(2)
+with col_date1:
+    start_date = st.date_input("Start date", value=min_dt, min_value=min_dt, max_value=max_dt)
+with col_date2:
+    end_date = st.date_input("End date", value=max_dt, min_value=min_dt, max_value=max_dt)
 
-k3.subheader("Outstanding")
-k3.markdown(f"**{inr(outstanding)}**")
+if start_date > end_date:
+    st.error("Start date cannot be after End date. Please adjust.")
+    st.stop()
 
-st.divider()
+col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+with col_f1:
+    bank_sel = st.multiselect("Bank Name", sorted([x for x in df['Bank Name'].dropna().unique()]))
+with col_f2:
+    pmode_sel = st.multiselect("Payment mode", sorted([x for x in df['Payment mode'].dropna().unique()]))
+with col_f3:
+    vendor_sel = st.multiselect("Vendor Name", sorted([x for x in df['Vendor Name'].dropna().unique()]))
+with col_f4:
+    pstatus_sel = st.multiselect("Payment status", sorted([x for x in df['Payment status'].dropna().unique()]))
 
-# Table & Download
-st.subheader("📊 Cleaned invoices")
-st.dataframe(fdf, use_container_width=True)
+filtered = filter_by_date_range(df, start_date, end_date, date_col_choice)
+filtered = add_optional_filters(filtered, bank_sel, pmode_sel, vendor_sel, pstatus_sel)
 
-csv_bytes = fdf.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="⬇️ Download cleaned & filtered CSV",
-    data=csv_bytes,
-    file_name="cleaned_invoices.csv",
-    mime="text/csv"
-)
+# --------------- Summaries ---------------
 
-# Monthly totals chart
-if date_col and date_col in fdf.columns and fdf[date_col].notna().any():
-    st.subheader("📈 Monthly totals")
-    monthly = (
-        fdf.dropna(subset=[date_col])
-           .assign(month=lambda x: x[date_col].dt.to_period("M").dt.to_timestamp())
-           .groupby("month", as_index=False)[amount_col].sum()
-           .sort_values("month")
+st.subheader("Summary (within selected filters)")
+m1, m2, m3, m4 = st.columns(4)
+with m1:
+    st.metric("Rows", value=len(filtered))
+with m2:
+    st.metric("Total Invoice Value", value=f"{filtered['Invoice value'].fillna(0).sum():,.2f}")
+with m3:
+    st.metric("Total Amount Paid", value=f"{filtered['Amount Paid'].fillna(0).sum():,.2f}")
+with m4:
+    paid_ct = int((filtered['Payment status'].astype(str).str.lower() == 'paid').sum())
+    unpaid_ct = int((filtered['Payment status'].astype(str).str.lower() != 'paid').sum())
+    st.metric("Paid / Unpaid", value=f"{paid_ct} / {unpaid_ct}")
+
+st.subheader("Pivot summaries")
+c_p1, c_p2 = st.columns(2)
+
+with c_p1:
+    st.caption("Amount Paid by Bank")
+    by_bank = (
+        filtered.groupby('Bank Name', dropna=True)['Amount Paid']
+        .sum()
+        .reset_index()
+        .sort_values('Amount Paid', ascending=False)
     )
-    st.line_chart(monthly.set_index("month")[amount_col], use_container_width=True)
+    st.dataframe(by_bank, use_container_width=True)
+    if not by_bank.empty:
+        st.bar_chart(by_bank.set_index('Bank Name'))
 
-st.caption(
-    "Configured columns: "
-    f"amount='{amount_col}', amount_paid='{amount_paid_col}', outstanding='{outstanding_col}', "
-    f"date='{date_col}', invoice_id='{invoice_id_col}', status='{status_col}'."
-)
+with c_p2:
+    st.caption("Invoice Value by Payment status")
+    by_status = (
+        filtered.groupby('Payment status', dropna=True)['Invoice value']
+        .sum()
+        .reset_index()
+        .sort_values('Invoice value', ascending=False)
+    )
+    st.dataframe(by_status, use_container_width=True)
+    if not by_status.empty:
+        st.bar_chart(by_status.set_index('Payment status'))
+
+# --------------- Results table & downloads ---------------
+
+st.subheader("Filtered Results")
+st.dataframe(filtered, use_container_width=True)
+
+dl_col1, dl_col2 = st.columns(2)
+with dl_col1:
+    st.download_button(
+        label="⬇️ Download filtered (Excel)",
+        data=to_excel_bytes(filtered),
+        file_name="filtered_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+with dl_col2:
+    st.download_button(
+        label="⬇️ Download filtered (CSV)",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="filtered_output.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+# --------------- Notes ---------------
+st.markdown(r"""
+**Notes & Tips**
+- Date columns (**Invoice date**, **Payment Date**, **Due date**) are converted to `datetime64[ns]` via `pd.to_datetime(..., errors='coerce')`.
+- Invalid or blank dates become **NaT** and are excluded by the date range filter (`.notna()`).
+- The date mask compares **pandas Series** to **pandas Timestamps**:
+  ```python
+  mask = ser.notna() & (ser >= start_ts) & (ser <= end_ts)
