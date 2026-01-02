@@ -3,7 +3,8 @@
 """
 Payments Totals — Streamlit app
 - Robust Excel date parsing (handles Excel serial numbers like 45413)
-- Filters by Invoice Date + optional Payment Status
+- Select the date column to filter by (Invoice date / Payment Date / Due date)
+- Filters by date range + optional Payment Status
 - KPIs: Total amount (Σ Invoice value), Amount paid (Σ Amount Paid), Amount to pay (Total − Paid)
 - Bank totals KPIs (by labels)
 - Vendor summary (amount to pay)
@@ -19,7 +20,7 @@ import streamlit as st
 # -------------------- UI config --------------------
 st.set_page_config(page_title="Payments Totals", layout="wide")
 st.title("Payments Totals")
-st.write("Pick **Start date** and **End date** by **Invoice Date**. We show:")
+st.write("Pick **Start date** and **End date** by your chosen **date column**. We show:")
 st.markdown(
     """
     - **Total amount** (Σ Invoice Value)
@@ -35,8 +36,7 @@ def read_excel_bytes(file_bytes: bytes, sheet_name=None, filename: str | None = 
     Read Excel robustly:
     - .xlsx → openpyxl
     - .xls  → xlrd (optional; add to requirements.txt if needed)
-    Shows a friendly error if dependencies are missing.
-    Returns either a DataFrame or a dict of DataFrames if sheet_name=None and workbook has multiple sheets.
+    Returns either a DataFrame or a dict of DataFrames.
     """
     if file_bytes is None:
         st.error("Please upload an Excel file in the sidebar.")
@@ -103,7 +103,7 @@ with st.sidebar:
     st.header("Load your data")
     uploaded = st.file_uploader("Upload Excel (.xlsx or .xls)", type=["xlsx", "xls"])
     sheet = st.text_input("Sheet name (optional)")
-    debug_mode = st.toggle("Debug bank summary", value=False)
+    debug_mode = st.toggle("Debug info", value=False)
 
 # Get file bytes (require upload on cloud)
 file_bytes = None
@@ -136,30 +136,45 @@ if df is None or df.empty:
 
 orig_cols = list(df.columns)
 
-# -------------------- Column mapping (defaults to common headers) --------------------
+# -------------------- Column mapping --------------------
 with st.sidebar:
     st.header("Map columns")
     def pick(label, default):
+        # Prefer exact match, else first column
         idx = orig_cols.index(default) if default in orig_cols else 0
         return st.selectbox(label, orig_cols, index=idx)
 
     # Adjust defaults to match your file names if needed:
-    invoice_date_col  = pick("Invoice Date", "Invoice date")
-    vendor_col        = pick("Vendor", "Vendor Name")
-    invoice_value_col = pick("Invoice Value (total)", "Invoice value")
-    amount_paid_col   = pick("Amount Paid", "Amount Paid")
-    status_col        = pick("Payment Status", "Payment Status")
-    bank_col          = pick("Bank", "Bank Name")
+    invoice_date_col   = pick("Invoice Date", "Invoice date")
+    payment_date_col   = pick("Payment Date", "Payment Date")   # if exists
+    due_date_col       = pick("Due Date", "Due date")           # if exists
+    vendor_col         = pick("Vendor", "Vendor Name")
+    invoice_value_col  = pick("Invoice Value (total)", "Invoice value")
+    amount_paid_col    = pick("Amount Paid", "Amount Paid")
+    status_col         = pick("Payment Status", "Payment Status")
+    bank_col           = pick("Bank", "Bank Name")
+
+    # Choose the date column to filter by
+    candidate_dates = []
+    for c in [invoice_date_col, payment_date_col, due_date_col]:
+        if c in orig_cols and c not in candidate_dates:
+            candidate_dates.append(c)
+    filter_date_col = st.selectbox("Date column to filter by", candidate_dates, index=0)
 
 # -------------------- Prepare & clean --------------------
 work = df.copy()
 
-# Robust date parsing for Excel serials & text dates
-work[invoice_date_col] = parse_excel_or_text_date(work[invoice_date_col])
+# Parse chosen filter date column robustly
+work[filter_date_col] = parse_excel_or_text_date(work[filter_date_col])
 
-# Coerce numerics defensively
+# Coerce numerics defensively (strip commas if any; coerce)
 for c in [invoice_value_col, amount_paid_col]:
-    work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+    work[c] = (
+        pd.to_numeric(
+            work[c].astype(str).str.replace(",", "", regex=False),
+            errors="coerce"
+        ).fillna(0)
+    )
 
 # Normalize status (handle 'Paid', 'unPaid', 'unpaid', 'Pending', etc.)
 if status_col in work.columns:
@@ -170,9 +185,10 @@ else:
     work["_StatusNorm"] = "Unknown"
 
 # -------------------- Filters --------------------
-min_d = pd.to_datetime(work[invoice_date_col]).min()
-max_d = pd.to_datetime(work[invoice_date_col]).max()
+min_d = pd.to_datetime(work[filter_date_col], errors="coerce").min()
+max_d = pd.to_datetime(work[filter_date_col], errors="coerce").max()
 if pd.isna(min_d) or pd.isna(max_d):
+    # Fallback range if all dates are NaT
     min_d = pd.Timestamp.today() - pd.Timedelta(days=365)
     max_d = pd.Timestamp.today()
 
@@ -195,7 +211,7 @@ with st.sidebar:
 start_ts = pd.to_datetime(start_date)
 end_ts   = pd.to_datetime(end_date)
 
-dt_series = pd.to_datetime(work[invoice_date_col], errors="coerce")
+dt_series = pd.to_datetime(work[filter_date_col], errors="coerce")
 date_mask = dt_series.between(start_ts, end_ts, inclusive="both")
 
 status_mask = pd.Series(True, index=work.index)
@@ -206,12 +222,20 @@ fdf = work.loc[date_mask & status_mask].copy()
 
 # -------------------- Debug hints --------------------
 if debug_mode:
-    st.info(f"DEBUG → filtered rows: {len(fdf)} | map → bank_col='{bank_col}', invoice_value_col='{invoice_value_col}', amount_paid_col='{amount_paid_col}'")
+    valid_dates = int(dt_series.notna().sum())
+    nat_dates = int(dt_series.isna().sum())
+    st.info(
+        f"DEBUG → total rows: {len(work)}, valid dates in '{filter_date_col}': {valid_dates}, NaT: {nat_dates}, "
+        f"parsed min: {pd.to_datetime(work[filter_date_col], errors='coerce').min()}, "
+        f"parsed max: {pd.to_datetime(work[filter_date_col], errors='coerce').max()}, "
+        f"filtered rows: {len(fdf)}"
+    )
     try:
         distinct_banks = sorted(fdf[bank_col].dropna().astype(str).str.strip().unique().tolist())
-        st.caption(f"DEBUG → first banks: {distinct_banks[:10]}")
+        st.caption(f"DEBUG → example banks: {distinct_banks[:10]}")
+        st.caption(f"DEBUG → sums: total={float(np.nansum(fdf[invoice_value_col]))}, paid={float(np.nansum(fdf[amount_paid_col]))}")
     except Exception as e:
-        st.caption(f"DEBUG → cannot list banks: {e}")
+        st.caption(f"DEBUG → cannot list banks or sums: {e}")
 
 # -------------------- Global KPIs --------------------
 total_amount = float(np.nansum(fdf[invoice_value_col]))
@@ -335,3 +359,33 @@ st.session_state["bank_summary_df"] = bank_summary_df.copy()
 st.dataframe(bank_summary_df, use_container_width=True, height=240)
 
 # -------------------- Export --------------------
+st.markdown("### Export")
+st.caption("Download filtered rows, vendor summary, bank totals, and bank summary.")
+
+excel_buf = io.BytesIO()
+with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    # Filtered rows
+    fdf[[filter_date_col, vendor_col, status_col, bank_col, invoice_value_col, amount_paid_col]].to_excel(
+        writer, sheet_name="Filtered", index=False
+    )
+    # Vendor summary
+    vendor_agg.to_excel(writer, sheet_name="VendorSummary", index=False)
+    # Bank totals sheet
+    pd.DataFrame({
+        "Bank": [hdfc_ca_label, hdfc_od_label, kotak_label, "SumOfThree", "TotalKPI"],
+        "Amount": [hdfc_ca_total, hdfc_od_total, kotak_total, sum_three, total_amount]
+    }).to_excel(writer, sheet_name="BankTotals", index=False)
+    # Bank summary (4 rows)
+    st.session_state["bank_summary_df"].to_excel(writer, sheet_name="BankSummary", index=False)
+
+excel_buf.seek(0)
+st.download_button(
+    "⬇️ Download Excel (filtered + vendor + bank totals + bank summary)",
+    data=excel_buf,
+    file_name=f"payments_totals_{pd.Timestamp.today().date()}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.markdown("---")
+st.markdown("### Load your data")
+st.write("Upload your file using the sidebar. Map columns if headers differ and pick the correct **date column** to filter by.")
