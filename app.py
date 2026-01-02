@@ -1,15 +1,16 @@
 
 # app.py
 """
-Payments Totals — Streamlit app
-- Robust Excel date parsing (handles Excel serial numbers like 45413)
+Payments Totals — Streamlit app (fully fixed)
+- Robust Excel date parsing (handles Excel serial numbers like 45413 and text dates)
 - Select the date column to filter by (Invoice date / Payment Date / Due date)
-- Filters by date range + optional Payment Status
+- Safe filtering via .between(); auto-skip date filter if selected column has 0 valid dates
+- Strict numeric sanitizer for amount columns (removes commas, ₹, spaces, symbols)
+- Normalizes Payment Status variants (Paid, Unpaid, Un paid, unPaid, Pending, etc.)
 - KPIs: Total amount (Σ Invoice value), Amount paid (Σ Amount Paid), Amount to pay (Total − Paid)
-- Bank totals KPIs (by labels)
-- Vendor summary (amount to pay)
-- Bank summary (4 rows: HDFC CA label, HDFC OD, Kotak OD, Others)
-- Export (Excel): Filtered, VendorSummary, BankTotals, BankSummary
+- Bank totals (metrics) by label
+- Bank summary (4 rows): HDFC CA label, HDFC OD, Kotak OD, Others
+- Export to Excel: Filtered, VendorSummary, BankTotals, BankSummary
 """
 
 import io
@@ -76,6 +77,16 @@ def parse_excel_or_text_date(series: pd.Series) -> pd.Series:
     if numeric_ratio >= 0.6:  # majority numeric → Excel serials
         return pd.to_datetime(numeric, origin="1899-12-30", unit="D", errors="coerce")
     return pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
+
+
+def to_amount(series: pd.Series) -> pd.Series:
+    """
+    Sanitize an amount column:
+    - keeps only digits, dot, minus
+    - strips commas, currency symbols (₹), spaces, and other text
+    """
+    cleaned = series.astype(str).str.replace(r"[^\d\.\-]", "", regex=True)
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
 
 
 def inr(x: float) -> str:
@@ -154,11 +165,13 @@ with st.sidebar:
     status_col         = pick("Payment Status", "Payment Status")
     bank_col           = pick("Bank", "Bank Name")
 
-    # Choose the date column to filter by
+    # Choose the date column to filter by (let you switch if one column is messy)
     candidate_dates = []
     for c in [invoice_date_col, payment_date_col, due_date_col]:
         if c in orig_cols and c not in candidate_dates:
             candidate_dates.append(c)
+    if not candidate_dates:
+        candidate_dates = [invoice_date_col]
     filter_date_col = st.selectbox("Date column to filter by", candidate_dates, index=0)
 
 # -------------------- Prepare & clean --------------------
@@ -167,20 +180,25 @@ work = df.copy()
 # Parse chosen filter date column robustly
 work[filter_date_col] = parse_excel_or_text_date(work[filter_date_col])
 
-# Coerce numerics defensively (strip commas if any; coerce)
-for c in [invoice_value_col, amount_paid_col]:
-    work[c] = (
-        pd.to_numeric(
-            work[c].astype(str).str.replace(",", "", regex=False),
-            errors="coerce"
-        ).fillna(0)
-    )
+# Coerce numerics defensively (sanitize first)
+work[invoice_value_col] = to_amount(work[invoice_value_col])
+work[amount_paid_col]   = to_amount(work[amount_paid_col])
 
-# Normalize status (handle 'Paid', 'unPaid', 'unpaid', 'Pending', etc.)
+# Normalize status (handle variants)
 if status_col in work.columns:
     s = work[status_col].astype(str).str.strip().str.lower()
-    norm = s.replace({"paid": "Paid", "unpaid": "Unpaid", "unpaid ": "Unpaid", "pending": "Pending"})
-    work["_StatusNorm"] = norm
+    work["_StatusNorm"] = s.replace({
+        "paid": "Paid",
+        "unpaid": "Unpaid",
+        "un paid": "Unpaid",
+        "un-paid": "Unpaid",
+        "unpaid ": "Unpaid",
+        "unpaid  ": "Unpaid",
+        "unpaid\t": "Unpaid",
+        "unpaid\r": "Unpaid",
+        "unpaid\n": "Unpaid",
+        "pending": "Pending",
+    })
 else:
     work["_StatusNorm"] = "Unknown"
 
@@ -207,12 +225,19 @@ with st.sidebar:
         "Payment status (optional)", options=["All", "Paid", "Unpaid", "Pending"], index=0
     )
 
-# Safe filter using .between()
+# Safe filter using .between(); auto-skip if zero valid dates
 start_ts = pd.to_datetime(start_date)
 end_ts   = pd.to_datetime(end_date)
 
 dt_series = pd.to_datetime(work[filter_date_col], errors="coerce")
-date_mask = dt_series.between(start_ts, end_ts, inclusive="both")
+valid_dates = int(dt_series.notna().sum())
+
+if valid_dates == 0:
+    # Don’t zero out the app—skip date filter but keep status filter
+    st.warning(f"No valid dates found in '{filter_date_col}'. Skipping date filter.")
+    date_mask = pd.Series(True, index=work.index)
+else:
+    date_mask = dt_series.between(start_ts, end_ts, inclusive="both")
 
 status_mask = pd.Series(True, index=work.index)
 if status_choice != "All":
@@ -222,7 +247,6 @@ fdf = work.loc[date_mask & status_mask].copy()
 
 # -------------------- Debug hints --------------------
 if debug_mode:
-    valid_dates = int(dt_series.notna().sum())
     nat_dates = int(dt_series.isna().sum())
     st.info(
         f"DEBUG → total rows: {len(work)}, valid dates in '{filter_date_col}': {valid_dates}, NaT: {nat_dates}, "
