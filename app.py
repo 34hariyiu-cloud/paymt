@@ -13,20 +13,18 @@ EXPECTED_COLS = [
     'Amount Paid', 'UTR no.', 'Payment status'
 ]
 
-# ---------- Helpers ----------
+# ---------------- Helper Functions ----------------
+
 def read_excel_fix_headers(source) -> pd.DataFrame:
-    """
-    Read Excel from path or file-like object, drop the embedded header row,
-    set EXPECTED_COLS deterministically.
-    """
+    """Read Excel (path or file-like), drop embedded header row, set EXPECTED_COLS."""
     df_raw = pd.read_excel(source, engine="openpyxl", header=None)
-    # Your file has a duplicated header in first row -> drop it
+    # Your file has the header repeated as the first row
     df = df_raw.iloc[1:].reset_index(drop=True)
     df.columns = EXPECTED_COLS
     return df
 
 def coerce_dates(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert date columns to datetime64[ns] and strip tz if present."""
+    """Convert date columns to datetime64[ns] and strip tz if any."""
     for c in ['Due date', 'Payment Date', 'Invoice date']:
         df[c] = pd.to_datetime(df[c], errors='coerce')  # default dayfirst=False
         if pd.api.types.is_datetime64tz_dtype(df[c]):
@@ -39,18 +37,11 @@ def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors='coerce')
     return df
 
-def filter_by_invoice_date(df: pd.DataFrame, start_dt: date, end_dt: date, date_col: str = 'Invoice date') -> pd.DataFrame:
-    """Inclusive range filter using pandas Series comparisons."""
-    # Normalize bounds
-    start_ts = pd.to_datetime(start_dt)  # midnight
+def filter_by_invoice_date(df: pd.DataFrame, start_dt: date, end_dt: date) -> pd.DataFrame:
+    """Inclusive range filter on 'Invoice date' using pandas Series comparisons."""
+    start_ts = pd.to_datetime(start_dt)
     end_ts   = pd.to_datetime(end_dt) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-
-    # Ensure column exists and is datetime (already coerced above)
-    if date_col not in df.columns:
-        st.warning(f"Column '{date_col}' not in DataFrame.")
-        return df.copy()
-
-    ser = df[date_col]  # KEEP AS SERIES
+    ser = df['Invoice date']  # keep as Series (no .values)
     mask = ser.notna() & (ser >= start_ts) & (ser <= end_ts)
     return df.loc[mask].copy()
 
@@ -61,12 +52,12 @@ def to_excel_bytes(df_out: pd.DataFrame) -> bytes:
     with open("filtered_output.xlsx", "rb") as f:
         return f.read()
 
-# ---------- UI: source ----------
+# ---------------- UI: Source ----------------
+
 st.title("💳 Payments Totals – Bank Breakdown (Minimal)")
-st.caption("Upload or point to the Excel file, then filter and download results.")
+st.caption("Upload or point to the Excel file, then filter by date.")
 
 DEFAULT_PATH = Path(__file__).with_name("Book10.xlsx")
-
 with st.expander("📁 Data source"):
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -78,7 +69,7 @@ with st.expander("📁 Data source"):
 try:
     if uploaded_file is not None:
         df = read_excel_fix_headers(uploaded_file)
-        st.success("✅ Uploaded file loaded")
+        st.success("✅ Uploaded file loaded.")
         src_used = "uploaded_file"
     else:
         p = Path(local_path)
@@ -98,14 +89,15 @@ df = coerce_numeric(df)
 
 # Preview
 with st.expander("🔎 Data preview & info"):
-    st.write("**Source**:", src_used)
-    st.write("**Shape**:", df.shape)
-    st.write("**Columns**:", list(df.columns))
-    st.write("**Dtypes**:")
+    st.write("**Source:**", src_used)
+    st.write("**Shape:**", df.shape)
+    st.write("**Columns:**", list(df.columns))
+    st.write("**Dtypes:**")
     st.write(df.dtypes.astype(str))
     st.dataframe(df.head(20), use_container_width=True)
 
-# ---------- Filters ----------
+# ---------------- Filters ----------------
+
 st.subheader("Filter by Invoice Date")
 invoice_dates = df['Invoice date'].dropna()
 min_inv = invoice_dates.min().date() if not invoice_dates.empty else date.today()
@@ -123,21 +115,32 @@ if start_date > end_date:
 
 filtered = filter_by_invoice_date(df, start_date, end_date)
 
-# Summary
-st.subheader("Summary")
-m1, m2, m3, m4 = st.columns(4)
+# ---------------- Summary (Amount Paid & Amount to be Paid) ----------------
+
+# Amount Paid for selected date range
+amount_paid = filtered['Amount Paid'].fillna(0).sum()
+
+# Outstanding per row = max(Invoice value - Amount Paid, 0) to avoid negatives
+outstanding_series = (filtered['Invoice value'].fillna(0) - filtered['Amount Paid'].fillna(0)).clip(lower=0)
+amount_to_be_paid = outstanding_series.sum()
+
+st.subheader("Summary (Selected Date Range)")
+m1, m2, m3, m4, m5 = st.columns(5)
 with m1:
     st.metric("Rows", len(filtered))
 with m2:
     st.metric("Total Invoice Value", f"{filtered['Invoice value'].fillna(0).sum():,.2f}")
 with m3:
-    st.metric("Total Amount Paid", f"{filtered['Amount Paid'].fillna(0).sum():,.2f}")
+    st.metric("Amount Paid", f"{amount_paid:,.2f}")
 with m4:
+    st.metric("Amount to be Paid", f"{amount_to_be_paid:,.2f}")
+with m5:
     paid_ct = (filtered['Payment status'].astype(str).str.lower() == 'paid').sum()
     unpaid_ct = (filtered['Payment status'].astype(str).str.lower() != 'paid').sum()
     st.metric("Paid / Unpaid", f"{paid_ct} / {unpaid_ct}")
 
-# Optional filters
+# ---------------- Optional Filters ----------------
+
 st.subheader("Optional Filters")
 f1, f2, f3 = st.columns(3)
 with f1:
@@ -155,22 +158,40 @@ if pmode_sel:
 if pstatus_sel:
     f2_df = f2_df[f2_df['Payment status'].isin(pstatus_sel)]
 
-st.subheader("Filtered Results")
+# Recompute Amount Paid and Amount to be Paid after optional filters
+amount_paid_opt = f2_df['Amount Paid'].fillna(0).sum()
+amount_to_be_paid_opt = (f2_df['Invoice value'].fillna(0) - f2_df['Amount Paid'].fillna(0)).clip(lower=0).sum()
+
+st.subheader("Filtered Results (after optional filters)")
+o1, o2 = st.columns(2)
+with o1:
+    st.metric("Amount Paid (after optional filters)", f"{amount_paid_opt:,.2f}")
+with o2:
+    st.metric("Amount to be Paid (after optional filters)", f"{amount_to_be_paid_opt:,.2f}")
+
 st.dataframe(f2_df, use_container_width=True)
 
-# Downloads
+# ---------------- Downloads ----------------
+
 c_dl1, c_dl2 = st.columns(2)
 with c_dl1:
-    st.download_button("⬇️ Download Excel", data=to_excel_bytes(f2_df),
-                       file_name="filtered_output.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "⬇️ Download Excel",
+        data=to_excel_bytes(f2_df),
+        file_name="filtered_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 with c_dl2:
-    st.download_button("⬇️ Download CSV", data=f2_df.to_csv(index=False).encode("utf-8"),
-                       file_name="filtered_output.csv", mime="text/csv")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=f2_df.to_csv(index=False).encode("utf-8"),
+        file_name="filtered_output.csv",
+        mime="text/csv",
+    )
 
 st.markdown(r"""
 **Notes**
-- Ensure you're loading the **same Excel file** you used in VS Code (check "Source" above).
-- Date comparisons are performed on pandas **Series** vs **Timestamp** only (no NumPy arrays).
-- Invalid or blank dates become NaT and are excluded by the date range.
+- *Amount Paid* is the sum of the **Amount Paid** column for the selected date range.
+- *Amount to be Paid* is calculated as **(Invoice value - Amount Paid)** per row, clipped at zero to avoid negatives, then summed.
+- If results differ from local VS Code, confirm the **Source** shown in the preview and ensure the same file is being used.
 """)
