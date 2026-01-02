@@ -2,7 +2,6 @@
 # app.py
 import os
 import platform
-import hashlib
 from pathlib import Path
 from datetime import date
 
@@ -51,7 +50,6 @@ def coerce_dates_with_choice(df: pd.DataFrame, fmt_choice: str) -> pd.DataFrame:
         for c in date_cols:
             df[c] = pd.to_datetime(df[c], format="%d/%m/%Y", errors='coerce')
     else:
-        # Fallback to auto
         for c in date_cols:
             df[c] = pd.to_datetime(df[c], errors='coerce')
 
@@ -81,30 +79,34 @@ def filter_by_invoice_date(df: pd.DataFrame, start_dt: date, end_dt: date) -> pd
     return df.loc[mask].copy()
 
 
-def compute_totals(filtered: pd.DataFrame) -> dict:
+def compute_totals_both(filtered: pd.DataFrame) -> dict:
     """
     Compute summary totals on the filtered frame.
-    - Amount Paid: sum(Amount Paid)
-    - Amount to be Paid (Outstanding overall): sum(max(Invoice value - Amount Paid, 0))
-    - Total Unpaid Amount (rows marked 'Un paid'): same outstanding but only rows with Payment status != 'Paid'
+    Returns both kinds of outstanding:
+      - amount_to_be_paid_all: outstanding across ALL filtered rows
+      - amount_to_be_paid_unpaid_only: outstanding only for rows with status != 'Paid'
     """
     inv_val = filtered['Invoice value'].fillna(0)
     amt_paid = filtered['Amount Paid'].fillna(0)
 
+    # Overall outstanding across ALL filtered rows (never negative)
     outstanding_all = (inv_val - amt_paid).clip(lower=0)
-    amount_to_be_paid = float(outstanding_all.sum())
+    amount_to_be_paid_all = float(outstanding_all.sum())
 
+    # Outstanding only for rows marked Un paid
     unpaid_mask = filtered['Payment status'].astype(str).str.lower() != 'paid'
-    outstanding_unpaid_only = (filtered.loc[unpaid_mask, 'Invoice value'].fillna(0)
-                               - filtered.loc[unpaid_mask, 'Amount Paid'].fillna(0)).clip(lower=0)
-    total_unpaid_amount = float(outstanding_unpaid_only.sum())
+    outstanding_unpaid_only = (
+        filtered.loc[unpaid_mask, 'Invoice value'].fillna(0)
+        - filtered.loc[unpaid_mask, 'Amount Paid'].fillna(0)
+    ).clip(lower=0)
+    amount_to_be_paid_unpaid_only = float(outstanding_unpaid_only.sum())
 
     return {
         "rows": len(filtered),
         "total_invoice_value": float(inv_val.sum()),
         "amount_paid": float(amt_paid.sum()),
-        "amount_to_be_paid": amount_to_be_paid,
-        "total_unpaid_amount": total_unpaid_amount,
+        "amount_to_be_paid_all": amount_to_be_paid_all,
+        "amount_to_be_paid_unpaid_only": amount_to_be_paid_unpaid_only,
         "paid_ct": int((filtered['Payment status'].astype(str).str.lower() == 'paid').sum()),
         "unpaid_ct": int(unpaid_mask.sum()),
     }
@@ -118,20 +120,8 @@ def to_excel_bytes(df_out: pd.DataFrame) -> bytes:
         return f.read()
 
 
-def df_digest(df: pd.DataFrame) -> str:
-    """
-    Lightweight hash of the first 200 rows across key columns to spot differences
-    between local VS Code run and Streamlit run.
-    """
-    cols = ['Bank Name', 'Payment mode', 'Due date', 'Payment Date', 'Vendor Name',
-            'Invoice number', 'Invoice date', 'Invoice value', 'TDS', 'Amount Paid', 'Payment status']
-    cols = [c for c in cols if c in df.columns]
-    sample_csv = df[cols].astype(str).head(200).to_csv(index=False)
-    return hashlib.md5(sample_csv.encode('utf-8')).hexdigest()
-
-
 # ----------------- UI: Data source -----------------
-st.title("💳 Payments Totals – Bank Breakdown (Minimal, Consistent)")
+st.title("💳 Payments Totals – Bank Breakdown (Minimal)")
 
 with st.expander("📁 Data source"):
     col1, col2 = st.columns([2, 1])
@@ -170,20 +160,13 @@ except Exception as e:
 df = coerce_dates_with_choice(df, date_format_choice)
 df = coerce_numeric(df)
 
-# ----------------- Diagnostics (to ensure identical runs) -----------------
-with st.expander("🔎 Diagnostics (compare vs your VS Code run)", expanded=False):
+# ----------------- Diagnostics (optional) -----------------
+with st.expander("🔎 Diagnostics (optional)", expanded=False):
     st.write("**Python**:", platform.python_version())
     st.write("**pandas**:", pd.__version__)
     st.write("**CWD**:", os.getcwd())
     st.write("**Source used:**", src_used)
     st.write("**Shape (rows, cols):**", df.shape)
-    st.write("**MD5 digest (first 200 rows):**", df_digest(df))
-
-    for c in ['Invoice date', 'Payment Date', 'Due date']:
-        if c in df.columns:
-            ser = df[c]
-            st.write(f"**{c}** → non-null: {int(ser.notna().sum())}, min: {ser.min()}, max: {ser.max()}")
-
     st.write("**Head (first 20 rows):**")
     st.dataframe(df.head(20), use_container_width=True)
 
@@ -206,8 +189,22 @@ if start_date > end_date:
 
 filtered = filter_by_invoice_date(df, start_date, end_date)
 
+# ----------------- Choice: which outstanding to show -----------------
+choice = st.radio(
+    "Amount to be Paid (Outstanding) should calculate for:",
+    ["All filtered rows", "Only rows with status 'Un paid'"],
+    index=0,
+    horizontal=True
+)
+
 # ----------------- Summary -----------------
-totals = compute_totals(filtered)
+totals = compute_totals_both(filtered)
+
+amount_to_show = (
+    totals["amount_to_be_paid_all"]
+    if choice == "All filtered rows"
+    else totals["amount_to_be_paid_unpaid_only"]
+)
 
 st.subheader("Summary (Selected Date Range)")
 m1, m2, m3, m4, m5 = st.columns(5)
@@ -218,15 +215,9 @@ with m2:
 with m3:
     st.metric("Amount Paid", f"{totals['amount_paid']:,.2f}")
 with m4:
-    st.metric("Amount to be Paid (Outstanding)", f"{totals['amount_to_be_paid']:,.2f}")
+    st.metric("Amount to be Paid (Outstanding)", f"{amount_to_show:,.2f}")
 with m5:
-    st.metric("Total Amount Unpaid (status 'Un paid')", f"{totals['total_unpaid_amount']:,.2f}")
-
-m6, m7 = st.columns(2)
-with m6:
-    st.metric("Paid count", totals["paid_ct"])
-with m7:
-    st.metric("Un paid count", totals["unpaid_ct"])
+    st.metric("Paid / Unpaid", f"{totals['paid_ct']} / {totals['unpaid_ct']}")
 
 # ----------------- Optional Filters -----------------
 st.subheader("Optional Filters")
@@ -246,14 +237,19 @@ if pmode_sel:
 if pstatus_sel:
     f2_df = f2_df[f2_df['Payment status'].isin(pstatus_sel)]
 
-totals_opt = compute_totals(f2_df)
+totals_opt = compute_totals_both(f2_df)
+amount_to_show_opt = (
+    totals_opt["amount_to_be_paid_all"]
+    if choice == "All filtered rows"
+    else totals_opt["amount_to_be_paid_unpaid_only"]
+)
 
 st.subheader("Filtered Results (after optional filters)")
 o1, o2 = st.columns(2)
 with o1:
     st.metric("Amount Paid (after optional filters)", f"{totals_opt['amount_paid']:,.2f}")
 with o2:
-    st.metric("Amount to be Paid (after optional filters)", f"{totals_opt['amount_to_be_paid']:,.2f}")
+    st.metric("Amount to be Paid (after optional filters)", f"{amount_to_show_opt:,.2f}")
 
 st.dataframe(f2_df, use_container_width=True)
 
@@ -277,9 +273,8 @@ with c_dl2:
 # ----------------- Notes -----------------
 st.markdown(r"""
 **Notes**
-- To guarantee identical results in VS Code and Streamlit, use the same Excel file and the **same date format** in the parser (select above).
-- *Amount Paid* = sum of **Amount Paid** in the selected date range.
-- *Amount to be Paid (Outstanding)* = sum of **max(Invoice value − Amount Paid, 0)** over all filtered rows.
-- *Total Amount Unpaid (status 'Un paid')* = outstanding only for rows whose **Payment status != 'Paid'**.
-- Diagnostics show path, Python/pandas versions, shape, hash digest, and min/max dates for quick comparison with your local run.
+- Place `Book10.xlsx` next to `app.py` or upload it via the top uploader.
+- Select the correct **date format** (Auto/MM/DD/YYYY/DD/MM/YYYY) to ensure identical parsing between VS Code and Streamlit.
+- *Amount to be Paid (Outstanding)* can be shown for **all filtered rows** or **only rows marked 'Un paid'** — use the radio choice above.
+- Comparisons use pandas **Series vs Timestamp** (no NumPy arrays), avoiding the original `TypeError`.
 """)
