@@ -2,13 +2,13 @@
 # app.py
 """
 Payments Totals — Streamlit app (fully fixed)
-- Robust Excel date parsing (handles Excel serial numbers like 45413 and text dates)
-- Select the date column to filter by (Invoice date / Payment Date / Due date)
-- Safe filtering via .between(); auto-skip date filter if selected column has 0 valid dates
-- Strict numeric sanitizer for amount columns (removes commas, ₹, spaces, symbols)
-- Normalizes Payment Status variants (Paid, Unpaid, Un paid, unPaid, Pending, etc.)
+- Robust Excel date parsing (handles Excel serial numbers and text dates)
+- Auto-detects the best date column (Invoice/Payment/Due date) and uses safe .between() filtering
+- Auto-skips the date filter if the chosen column has 0 valid dates (prevents 1970 + zero totals)
+- Strict amount sanitizer (converts strings like "₹1,534,320.60" / "31,227.52" to floats)
+- Normalizes Payment Status variants (Paid, Unpaid, Un paid, Pending, etc.)
 - KPIs: Total amount (Σ Invoice value), Amount paid (Σ Amount Paid), Amount to pay (Total − Paid)
-- Bank totals (metrics) by label
+- Bank totals KPIs (by labels)
 - Bank summary (4 rows): HDFC CA label, HDFC OD, Kotak OD, Others
 - Export to Excel: Filtered, VendorSummary, BankTotals, BankSummary
 """
@@ -66,22 +66,9 @@ def read_excel_bytes(file_bytes: bytes, sheet_name=None, filename: str | None = 
     return pd.read_excel(buf, sheet_name=sheet_name, engine=engine)
 
 
-def parse_excel_or_text_date(series: pd.Series) -> pd.Series:
-    """
-    Convert mixed date series:
-    - If values are mostly numeric → treat as Excel serial dates (origin=1899-12-30).
-    - Otherwise, parse as text dates.
-    """
-    numeric = pd.to_numeric(series, errors="coerce")
-    numeric_ratio = numeric.notna().mean()
-    if numeric_ratio >= 0.6:  # majority numeric → Excel serials
-        return pd.to_datetime(numeric, origin="1899-12-30", unit="D", errors="coerce")
-    return pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
-
-
 def to_amount(series: pd.Series) -> pd.Series:
     """
-    Sanitize an amount column:
+    Sanitize amounts:
     - keeps only digits, dot, minus
     - strips commas, currency symbols (₹), spaces, and other text
     """
@@ -89,12 +76,25 @@ def to_amount(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
 
 
-def inr(x: float) -> str:
-    """Format as ₹ currency."""
-    try:
-        return f"₹{float(x):,.2f}"
-    except Exception:
-        return "₹0.00"
+def parse_excel_date_auto(s: pd.Series) -> pd.Series:
+    """
+    Smart date parser:
+    - Detects Excel serial ranges (Windows 1899-12-30, Mac 1904-01-01) and parses
+    - Otherwise, attempts text date parsing
+    """
+    num = pd.to_numeric(s, errors="coerce")
+
+    # Heuristic ranges for serials (typical invoice dates ~1980-2040)
+    windows_serial = num.between(30000, 60000).mean() > 0.5   # origin 1899-12-30
+    mac_serial     = num.between(10000, 60000).mean() > 0.5 and not windows_serial  # origin 1904-01-01
+
+    if windows_serial:
+        return pd.to_datetime(num, origin="1899-12-30", unit="D", errors="coerce")
+    if mac_serial:
+        return pd.to_datetime(num, origin="1904-01-01", unit="D", errors="coerce")
+
+    # Fallback: text dates
+    return pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
 
 
 def contains_match(series: pd.Series, label: str) -> pd.Series:
@@ -165,26 +165,28 @@ with st.sidebar:
     status_col         = pick("Payment Status", "Payment Status")
     bank_col           = pick("Bank", "Bank Name")
 
-    # Choose the date column to filter by (let you switch if one column is messy)
-    candidate_dates = []
-    for c in [invoice_date_col, payment_date_col, due_date_col]:
-        if c in orig_cols and c not in candidate_dates:
-            candidate_dates.append(c)
-    if not candidate_dates:
-        candidate_dates = [invoice_date_col]
-    filter_date_col = st.selectbox("Date column to filter by", candidate_dates, index=0)
-
 # -------------------- Prepare & clean --------------------
 work = df.copy()
 
-# Parse chosen filter date column robustly
-work[filter_date_col] = parse_excel_or_text_date(work[filter_date_col])
-
-# Coerce numerics defensively (sanitize first)
+# Sanitize amounts first (prevents zero totals due to text/₹/commas)
 work[invoice_value_col] = to_amount(work[invoice_value_col])
 work[amount_paid_col]   = to_amount(work[amount_paid_col])
 
-# Normalize status (handle variants)
+# Parse ALL candidate date columns, auto-pick the best
+candidate_date_cols = []
+for c in [invoice_date_col, payment_date_col, due_date_col]:
+    if c in work.columns and c not in candidate_date_cols:
+        candidate_date_cols.append(c)
+
+parsed_date_map = {}
+for c in candidate_date_cols:
+    parsed_date_map[c] = parse_excel_date_auto(work[c])
+
+# Choose the date column with MAX valid values
+best_date_col = max(parsed_date_map.keys(), key=lambda c: parsed_date_map[c].notna().sum())
+dt_series_best = parsed_date_map[best_date_col]
+
+# Normalize Payment Status variants
 if status_col in work.columns:
     s = work[status_col].astype(str).str.strip().str.lower()
     work["_StatusNorm"] = s.replace({
@@ -193,18 +195,15 @@ if status_col in work.columns:
         "un paid": "Unpaid",
         "un-paid": "Unpaid",
         "unpaid ": "Unpaid",
-        "unpaid  ": "Unpaid",
-        "unpaid\t": "Unpaid",
-        "unpaid\r": "Unpaid",
-        "unpaid\n": "Unpaid",
         "pending": "Pending",
     })
 else:
     work["_StatusNorm"] = "Unknown"
 
 # -------------------- Filters --------------------
-min_d = pd.to_datetime(work[filter_date_col], errors="coerce").min()
-max_d = pd.to_datetime(work[filter_date_col], errors="coerce").max()
+# Use the parsed best date series for bounds
+min_d = dt_series_best.min()
+max_d = dt_series_best.max()
 if pd.isna(min_d) or pd.isna(max_d):
     # Fallback range if all dates are NaT
     min_d = pd.Timestamp.today() - pd.Timedelta(days=365)
@@ -225,19 +224,16 @@ with st.sidebar:
         "Payment status (optional)", options=["All", "Paid", "Unpaid", "Pending"], index=0
     )
 
-# Safe filter using .between(); auto-skip if zero valid dates
+# Safe filter using the already-parsed best date column
 start_ts = pd.to_datetime(start_date)
 end_ts   = pd.to_datetime(end_date)
 
-dt_series = pd.to_datetime(work[filter_date_col], errors="coerce")
-valid_dates = int(dt_series.notna().sum())
-
+valid_dates = int(dt_series_best.notna().sum())
 if valid_dates == 0:
-    # Don’t zero out the app—skip date filter but keep status filter
-    st.warning(f"No valid dates found in '{filter_date_col}'. Skipping date filter.")
+    st.warning(f"No valid dates found in '{best_date_col}'. Skipping date filter.")
     date_mask = pd.Series(True, index=work.index)
 else:
-    date_mask = dt_series.between(start_ts, end_ts, inclusive="both")
+    date_mask = dt_series_best.between(start_ts, end_ts, inclusive="both")
 
 status_mask = pd.Series(True, index=work.index)
 if status_choice != "All":
@@ -245,13 +241,17 @@ if status_choice != "All":
 
 fdf = work.loc[date_mask & status_mask].copy()
 
+# Show which date column was used (helps you verify it’s not 1970 anymore)
+st.caption(
+    f"Date column used for filtering: **{best_date_col}** "
+    f"(valid dates: {valid_dates}, min: {dt_series_best.min()}, max: {dt_series_best.max()})"
+)
+
 # -------------------- Debug hints --------------------
 if debug_mode:
-    nat_dates = int(dt_series.isna().sum())
+    nat_dates = int(dt_series_best.isna().sum())
     st.info(
-        f"DEBUG → total rows: {len(work)}, valid dates in '{filter_date_col}': {valid_dates}, NaT: {nat_dates}, "
-        f"parsed min: {pd.to_datetime(work[filter_date_col], errors='coerce').min()}, "
-        f"parsed max: {pd.to_datetime(work[filter_date_col], errors='coerce').max()}, "
+        f"DEBUG → total rows: {len(work)}, valid dates in '{best_date_col}': {valid_dates}, NaT: {nat_dates}, "
         f"filtered rows: {len(fdf)}"
     )
     try:
@@ -378,7 +378,7 @@ rows = [
 ]
 bank_summary_df = pd.DataFrame(rows)
 
-# Keep for export and render (raw numbers to match screenshot style)
+# Keep for export and render (raw numbers to match your screenshot style)
 st.session_state["bank_summary_df"] = bank_summary_df.copy()
 st.dataframe(bank_summary_df, use_container_width=True, height=240)
 
@@ -388,8 +388,8 @@ st.caption("Download filtered rows, vendor summary, bank totals, and bank summar
 
 excel_buf = io.BytesIO()
 with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-    # Filtered rows
-    fdf[[filter_date_col, vendor_col, status_col, bank_col, invoice_value_col, amount_paid_col]].to_excel(
+    # Filtered rows (use the date column we actually filtered by)
+    fdf[[best_date_col, vendor_col, status_col, bank_col, invoice_value_col, amount_paid_col]].to_excel(
         writer, sheet_name="Filtered", index=False
     )
     # Vendor summary
@@ -412,4 +412,4 @@ st.download_button(
 
 st.markdown("---")
 st.markdown("### Load your data")
-st.write("Upload your file using the sidebar. Map columns if headers differ and pick the correct **date column** to filter by.")
+st.write("Upload your file using the sidebar. Map columns if headers differ; the app will auto-pick the best **date column** to filter by.")
