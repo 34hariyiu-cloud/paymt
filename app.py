@@ -1,17 +1,7 @@
 
-# app.py
-"""
-Payments Totals — Streamlit app
-- Robust Excel date parsing (handles Excel serial numbers like 45413)
-- Filters by Invoice Date + optional Payment Status
-- KPIs: Total amount (Σ Invoice value), Amount paid (Σ Amount Paid), Amount to pay (Total − Paid)
-- Bank totals KPIs (by labels)
-- Vendor summary (amount to pay)
-- Bank summary (4 rows: HDFC CA label, HDFC OD, Kotak OD, Others)
-- Export (Excel): Filtered, VendorSummary, BankTotals, BankSummary
-"""
 
 import io
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -30,53 +20,14 @@ st.markdown(
 
 # -------------------- Helpers --------------------
 @st.cache_data
-def read_excel_bytes(file_bytes: bytes, sheet_name=None, filename: str | None = None) -> pd.DataFrame | dict:
-    """
-    Read Excel robustly:
-    - .xlsx → openpyxl
-    - .xls  → xlrd (optional; add to requirements.txt if needed)
-    Shows a friendly error if dependencies are missing.
-    Returns either a DataFrame or a dict of DataFrames if sheet_name=None and workbook has multiple sheets.
-    """
-    if file_bytes is None:
-        st.error("Please upload an Excel file in the sidebar.")
-        st.stop()
+def read_excel_bytes(file_bytes, sheet_name=None):
+    """Read .xlsx via openpyxl engine."""
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine="openpyxl")
 
-    buf = io.BytesIO(file_bytes)
-
-    # Choose engine using filename; default to openpyxl
-    engine = "openpyxl"
-    if filename and filename.lower().endswith(".xls"):
-        engine = "xlrd"
-
-    # Dependency check
-    try:
-        if engine == "openpyxl":
-            import openpyxl  # noqa: F401
-        else:
-            import xlrd      # noqa: F401
-    except ImportError as e:
-        st.error(
-            f"Missing Excel dependency: {e}. "
-            "Update requirements.txt (include openpyxl for .xlsx, xlrd for .xls) and redeploy."
-        )
-        st.stop()
-
-    return pd.read_excel(buf, sheet_name=sheet_name, engine=engine)
-
-
-def parse_excel_or_text_date(series: pd.Series) -> pd.Series:
-    """
-    Convert mixed date series:
-    - If values are mostly numeric → treat as Excel serial dates (origin=1899-12-30).
-    - Otherwise, parse as text dates.
-    """
-    numeric = pd.to_numeric(series, errors="coerce")
-    numeric_ratio = numeric.notna().mean()
-    if numeric_ratio >= 0.6:  # majority numeric → Excel serials
-        return pd.to_datetime(numeric, origin="1899-12-30", unit="D", errors="coerce")
-    return pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
-
+@st.cache_data
+def load_local_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
 
 def inr(x: float) -> str:
     """Format as ₹ currency."""
@@ -85,44 +36,53 @@ def inr(x: float) -> str:
     except Exception:
         return "₹0.00"
 
+def parse_excel_or_text_date(series: pd.Series) -> pd.Series:
+    """
+    Convert mixed date series:
+    - If values look like Excel serials (mostly numeric), parse with origin=1899-12-30.
+    - Otherwise, use pandas to_datetime with infer.
+    """
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric_ratio = numeric.notna().mean()
+    if numeric_ratio >= 0.6:  # majority numeric → assume Excel serial
+        return pd.to_datetime(numeric, origin="1899-12-30", unit="D", errors="coerce")
+    return pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
 
 def contains_match(series: pd.Series, label: str) -> pd.Series:
     """Case-insensitive 'contains' match."""
     s = series.astype(str).str.lower()
     return s.str.contains(str(label).lower(), na=False)
 
-
 def exact_match(series: pd.Series, label: str) -> pd.Series:
     """Exact match after trimming."""
     s = series.astype(str).str.strip()
     return s == str(label).strip()
 
-
 # -------------------- Sidebar: data source --------------------
 with st.sidebar:
     st.header("Load your data")
-    uploaded = st.file_uploader("Upload Excel (.xlsx or .xls)", type=["xlsx", "xls"])
+    st.caption("We will auto-load ./data/sampledata234.xlsx if present or you can upload your own Excel.")
+    local_path = os.path.join("data", "sampledata234.xlsx")
+    uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
     sheet = st.text_input("Sheet name (optional)")
     debug_mode = st.toggle("Debug bank summary", value=False)
 
-# Get file bytes (require upload on cloud)
+# Determine source
 file_bytes = None
 source_text = None
 if uploaded is not None:
     file_bytes = uploaded.getvalue()
     source_text = f"Uploaded: {uploaded.name}"
+elif os.path.isfile(local_path):
+    file_bytes = load_local_bytes(local_path)
+    source_text = f"Loaded local file: {local_path}"
 else:
-    source_text = "Upload an Excel file using the sidebar."
-
+    st.error("No data source. Upload an Excel file or place ./data/sampledata234.xlsx.")
+    st.stop()
 st.caption(source_text)
 
-# Stop if no file (prevents downstream errors)
-if file_bytes is None:
-    st.info("Please upload an Excel file to proceed.")
-    st.stop()
-
 # Read workbook (support multi-sheet)
-raw = read_excel_bytes(file_bytes, sheet_name=(sheet or None), filename=(uploaded.name if uploaded else None))
+raw = read_excel_bytes(file_bytes, sheet_name=(sheet or None))
 if isinstance(raw, dict):
     names = list(raw.keys())
     with st.sidebar:
@@ -137,20 +97,20 @@ if df is None or df.empty:
 
 orig_cols = list(df.columns)
 
-# -------------------- Column mapping (defaults to common headers) --------------------
+# -------------------- Column mapping (defaults match your file) --------------------
 with st.sidebar:
     st.header("Map columns")
     def pick(label, default):
         idx = orig_cols.index(default) if default in orig_cols else 0
         return st.selectbox(label, orig_cols, index=idx)
 
-    # Adjust defaults to match your file names if needed:
+    # Defaults aligned to sampledata234.xlsx
     invoice_date_col = pick("Invoice Date", "Invoice date")
-    vendor_col       = pick("Vendor", "Vendor Name")
+    vendor_col = pick("Vendor", "Vendor Name")
     invoice_value_col = pick("Invoice Value (total)", "Invoice value")
-    amount_paid_col   = pick("Amount Paid", "Amount Paid")
-    status_col        = pick("Payment Status", "Payment Status")
-    bank_col          = pick("Bank", "Bank Name")
+    amount_paid_col = pick("Amount Paid", "Amount Paid")
+    status_col = pick("Payment Status", "Payment Status")
+    bank_col = pick("Bank", "Bank Name")
 
 # -------------------- Prepare & clean --------------------
 work = df.copy()
@@ -192,18 +152,14 @@ with st.sidebar:
         "Payment status (optional)", options=["All", "Paid", "Unpaid", "Pending"], index=0
     )
 
-# Safe filter using .between()
-start_ts = pd.to_datetime(start_date)
-end_ts   = pd.to_datetime(end_date)
-
-dt_series = pd.to_datetime(work[invoice_date_col], errors="coerce")
-date_mask = dt_series.between(start_ts, end_ts, inclusive="both")
-
-status_mask = pd.Series(True, index=work.index)
+mask = (
+    (work[invoice_date_col] >= pd.to_datetime(start_date)) &
+    (work[invoice_date_col] <= pd.to_datetime(end_date))
+)
 if status_choice != "All":
-    status_mask = (work["_StatusNorm"] == status_choice)
+    mask &= (work["_StatusNorm"] == status_choice)
 
-fdf = work.loc[date_mask & status_mask].copy()
+fdf = work.loc[mask].copy()
 
 # -------------------- Debug hints --------------------
 if debug_mode:
@@ -235,11 +191,11 @@ with k3:
 st.markdown("### Bank totals (Σ Invoice Value by Bank label)")
 with st.sidebar:
     st.header("Bank settings")
-    # Defaults commonly used in your data; change as needed in UI
+    # Defaults match your data
     hdfc_ca_label = st.text_input("Bank name for HDFC CA", value="HDFC CA - 87975")
     hdfc_od_label = st.text_input("Bank name for HDFC OD", value="HDFC OD")
-    kotak_label   = st.text_input("Bank name for Kotak OD", value="Kotak OD")
-    match_mode    = st.radio("Match mode", ["Exact", "Contains"], index=1)  # default Contains
+    kotak_label = st.text_input("Bank name for Kotak OD", value="Kotak OD")
+    match_mode = st.radio("Match mode", ["Exact", "Contains"], index=1)  # default Contains
 
 def bank_mask(df: pd.DataFrame, label: str) -> pd.Series:
     return exact_match(df[bank_col], label) if match_mode == "Exact" else contains_match(df[bank_col], label)
@@ -263,5 +219,108 @@ with b3:
 with b4:
     st.metric("Sum of three", inr(sum_three))
 
-# Reconciliation note + others total by complement
+# Reconciliation note
+all_three_mask = bank_mask(fdf, hdfc_ca_label) | bank_mask(fdf, hdfc_od_label) | bank_mask(fdf, kotak_label)
+others_total_amount = float(fdf.loc[~all_three_mask, invoice_value_col].sum())
+if abs(sum_three - total_amount) < 0.005:
+    st.success("✔️ Sum of the three bank totals equals the Total amount KPI.")
+else:
+    st.warning(
+        f"⚠️ Sum of three = {inr(sum_three)} vs Total amount = {inr(total_amount)}. "
+        f"Remaining (other banks) = {inr(others_total_amount)}."
+    )
+
+# -------------------- Vendor summary (amount to pay) --------------------
+st.markdown("### Vendor summary (amount to pay)")
+st.caption("Shows how much is pending per vendor in the selected date range.")
+
+vendor_agg = fdf.groupby(vendor_col).agg(
+    Invoices=(vendor_col, "size"),
+    TotalAmount=(invoice_value_col, "sum"),
+    AmountPaid=(amount_paid_col, "sum"),
+).reset_index()
+vendor_agg["AmountToPay"] = vendor_agg["TotalAmount"] - vendor_agg["AmountPaid"]
+
+# Pretty table (₹ formatting for vendor view)
+show_vendor = vendor_agg.copy()
+for c in ["TotalAmount", "AmountPaid", "AmountToPay"]:
+    show_vendor[c] = show_vendor[c].apply(inr)
+
+st.dataframe(
+    show_vendor.rename(columns={
+        vendor_col: "Vendor",
+        "Invoices": "Invoices",
+        "TotalAmount": "Total amount (₹)",
+        "AmountPaid": "Amount paid (₹)",
+        "AmountToPay": "Amount to pay (₹)",
+    }),
+    use_container_width=True,
+)
+
+# -------------------- Bank Summary (4 rows: HDFC CA, HDFC OD, Kotak OD, Others) --------------------
+st.markdown("### Bank summary")
+
+def summary_row(df: pd.DataFrame, label: str, mask_series: pd.Series) -> dict:
+    txns = int(mask_series.sum())
+    total = float(df.loc[mask_series, invoice_value_col].sum())
+    paid  = float(df.loc[mask_series, amount_paid_col].sum())
+    amt_to_pay = total - paid
+    return {
+        "Bank Name": label,
+        "Txns": txns,
+        "TotalAmount": total,
+        "AmountToPay": amt_to_pay,
+        "PaidAmount": paid,
+        "Outstanding": amt_to_pay,
+    }
+
+# Build masks for the three labels and Others
 m_ca    = bank_mask(fdf, hdfc_ca_label)
+m_od    = bank_mask(fdf, hdfc_od_label)
+m_kotak = bank_mask(fdf, kotak_label)
+m_three = m_ca | m_od | m_kotak
+m_others = ~m_three
+
+rows = [
+    summary_row(fdf, hdfc_ca_label, m_ca),
+    summary_row(fdf, hdfc_od_label, m_od),
+    summary_row(fdf, kotak_label,   m_kotak),
+    summary_row(fdf, "Others",       m_others),
+]
+bank_summary_df = pd.DataFrame(rows)
+
+# Keep for export and render (raw numbers to match your screenshot)
+st.session_state["bank_summary_df"] = bank_summary_df.copy()
+st.dataframe(bank_summary_df, use_container_width=True, height=220)
+
+# -------------------- Export --------------------
+st.markdown("### Export")
+st.caption("Download filtered rows, vendor summary, bank totals, and bank summary.")
+
+excel_buf = io.BytesIO()
+with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    # Filtered rows
+    fdf[[invoice_date_col, vendor_col, status_col, bank_col, invoice_value_col, amount_paid_col]].to_excel(
+        writer, sheet_name="Filtered", index=False
+    )
+    # Vendor summary
+    vendor_agg.to_excel(writer, sheet_name="VendorSummary", index=False)
+    # Bank totals sheet
+    pd.DataFrame({
+        "Bank": [hdfc_ca_label, hdfc_od_label, kotak_label, "SumOfThree", "TotalKPI"],
+        "Amount": [hdfc_ca_total, hdfc_od_total, kotak_total, sum_three, total_amount]
+    }).to_excel(writer, sheet_name="BankTotals", index=False)
+    # Bank summary (4 rows)
+    st.session_state["bank_summary_df"].to_excel(writer, sheet_name="BankSummary", index=False)
+
+excel_buf.seek(0)
+st.download_button(
+    "⬇️ Download Excel (filtered + vendor + bank totals + bank summary)",
+    data=excel_buf,
+    file_name=f"payments_totals_{pd.Timestamp.today().date()}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.markdown("---")
+st.markdown("### Load your data")
+st.write("Keep **./data/sampledata234.xlsx** or upload your file via the sidebar.")
